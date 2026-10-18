@@ -77,6 +77,19 @@ public class ObjcMessageAnalyzer extends AbstractAnalyzer {
 	private Map<String, Integer> classExternalSymbolOffset = new HashMap<>();
 	private Map<Address, String> stubSelectors = new ConcurrentHashMap<>();
 	private Map<Address, Object> stubLocks = new ConcurrentHashMap<>();
+	// Per-thread memo of the varnode back-slices of the function being processed
+	private final ThreadLocal<VarnodeMemo> varnodeMemo = ThreadLocal.withInitial(VarnodeMemo::new);
+
+	private static class VarnodeMemo {
+		static final Object NONE = new Object();
+		final Map<Varnode, Object[]> addresses = new IdentityHashMap<>();
+		final Map<Varnode, Map<Integer, Optional<String>>> names = new IdentityHashMap<>();
+
+		void clear() {
+			addresses.clear();
+			names.clear();
+		}
+	}
 
 	private record DataTypes(DataType ptr, DataType id, DataType sel, DataType classT,
 			DataType messageRef, DataType messageRefPtr, DataType objcSuper,
@@ -399,19 +412,28 @@ public class ObjcMessageAnalyzer extends AbstractAnalyzer {
 			return;
 		}
 		Function function = highFunction.getFunction();
-		List<Message> messages = findMessages(program, highFunction, decompiler, monitor);
-		for (Message msg : messages) {
-			monitor.checkCancelled();
-			List<String> parameters = new ArrayList<>();
-			Varnode[] inputs = msg.op.getInputs();
-			int paramStart = msg.varargParamIndex;
-			for (int i = paramStart; i < inputs.length; i++) {
-				String paramValue =
-					getNameForVarnode(program, function, inputs[i], false, false, 0, 1, monitor);
-				parameters.add(getIvarNameFromQualifiedName(paramValue));
+		VarnodeMemo memo = varnodeMemo.get();
+		memo.clear();
+		try {
+			List<Message> messages = findMessages(program, highFunction, decompiler, monitor);
+			for (Message msg : messages) {
+				monitor.checkCancelled();
+				// Parameter names may depend on program changes made for earlier messages
+				memo.names.clear();
+				List<String> parameters = new ArrayList<>();
+				Varnode[] inputs = msg.op.getInputs();
+				int paramStart = msg.varargParamIndex;
+				for (int i = paramStart; i < inputs.length; i++) {
+					String paramValue = getNameForVarnode(program, function, inputs[i], false,
+						false, 0, 1, monitor);
+					parameters.add(getIvarNameFromQualifiedName(paramValue));
+				}
+				updateExternalBlock(program, msg, log);
+				setCommentAndReference(program, msg, parameters, log);
 			}
-			updateExternalBlock(program, msg, log);
-			setCommentAndReference(program, msg, parameters, log);
+		}
+		finally {
+			memo.clear();
 		}
 	}
 	
@@ -582,6 +604,19 @@ public class ObjcMessageAnalyzer extends AbstractAnalyzer {
 		if (depth >= MAX_RECURSION_DEPTH) {
 			return null;
 		}
+		// The back-slice revisits shared varnodes once per path, which is exponential in the
+		// depth limit; results only depend on (varnode, depth)
+		Object[] slots = varnodeMemo.get().addresses.computeIfAbsent(input,
+			k -> new Object[MAX_RECURSION_DEPTH]);
+		if (slots[depth] == null) {
+			Address address = computeAddressFromVarnode(program, input, depth, monitor);
+			slots[depth] = address == null ? VarnodeMemo.NONE : address;
+		}
+		return slots[depth] == VarnodeMemo.NONE ? null : (Address) slots[depth];
+	}
+
+	private Address computeAddressFromVarnode(Program program, Varnode input, int depth,
+			TaskMonitor monitor) throws CancelledException {
 		if (!input.isAddress() && !input.isConstant()) {
 			PcodeOp def = input.getDef();
 			if (def == null) {
@@ -614,6 +649,25 @@ public class ObjcMessageAnalyzer extends AbstractAnalyzer {
 	}
 
 	private String getNameForVarnode(Program program, Function function, Varnode input,
+			boolean isClass, boolean isMethod, int depth, int numInputs, TaskMonitor monitor) {
+		if (input == null) {
+			return null;
+		}
+		// Same exponential revisiting as getAddressFromVarnode; cache per argument combination
+		int key = ((depth * 64 + Math.min(numInputs, 63)) * 2 + (isClass ? 1 : 0)) * 2 +
+			(isMethod ? 1 : 0);
+		Map<Integer, Optional<String>> names =
+			varnodeMemo.get().names.computeIfAbsent(input, k -> new HashMap<>());
+		Optional<String> cached = names.get(key);
+		if (cached == null) {
+			cached = Optional.ofNullable(computeNameForVarnode(program, function, input, isClass,
+				isMethod, depth, numInputs, monitor));
+			names.put(key, cached);
+		}
+		return cached.orElse(null);
+	}
+
+	private String computeNameForVarnode(Program program, Function function, Varnode input,
 			boolean isClass, boolean isMethod, int depth, int numInputs, TaskMonitor monitor) {
 		try {
 			if (depth >= MAX_RECURSION_DEPTH) {
